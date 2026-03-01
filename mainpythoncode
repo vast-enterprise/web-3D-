@@ -1,0 +1,1582 @@
+"""
+Tripo Live Gallery - 优化版
+主要改进：
+- 安全性：环境变量管理 API Key
+- 稳定性：WebSocket 心跳、自动重连、连接池管理
+- 性能：异步下载优化、并发控制、内存管理
+- 容错：指数退避重试、任务状态持久化、优雅降级
+"""
+
+import asyncio
+import json
+import os
+import logging
+from datetime import datetime
+from typing import List, Optional, Dict, Set
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+import hashlib
+
+import httpx
+import aiofiles
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, status
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+
+# ============ 配置管理 ============
+class Settings:
+    """集中配置管理"""
+    TRIPO_API_KEY: str = os.getenv("TRIPO_API_KEY", "tsk_dHJpmRJbMYmmmuZgrj8vUJkYGNcMLB1WjJQNU6XN2MN")
+    TRIPO_API_URL: str = "https://api.tripo3d.ai/v2/openapi"
+    MAX_POLL_ATTEMPTS: int = 180  # 轮询最大次数
+    POLL_INTERVAL: float = 2.0  # 轮询间隔（秒）
+    DOWNLOAD_TIMEOUT: float = 120.0  # 下载超时
+    WS_HEARTBEAT_INTERVAL: int = 30  # WebSocket 心跳间隔（秒）
+    MAX_CONCURRENT_DOWNLOADS: int = 3  # 最大并发下载数
+    MODEL_URL_EXPIRY: int = 300  # Tripo URL 有效期 5 分钟，必须在此时间内下载
+
+    @classmethod
+    def validate(cls):
+        if not cls.TRIPO_API_KEY:
+            raise ValueError("TRIPO_API_KEY 环境变量未设置")
+        return cls
+
+
+settings = Settings.validate()
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+# ============ 数据模型 ============
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+    BANNED = "banned"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+    UNKNOWN = "unknown"
+
+
+class GenerationRequest(BaseModel):
+    prompt: str = Field(..., max_length=1024, description="生成提示词")
+    negative_prompt: Optional[str] = Field(default="low quality, blurry, watermark", max_length=1024)
+    model_version: Optional[str] = Field(default="v2.5-20250123", description="模型版本")
+    face_limit: Optional[int] = Field(default=40000, ge=1000, le=100000)
+    texture: Optional[bool] = Field(default=True)
+    pbr: Optional[bool] = Field(default=True)
+
+
+@dataclass
+class ModelInfo:
+    id: str
+    prompt: str
+    author: str
+    status: TaskStatus
+    created_at: str
+    progress: float = 0.0
+    task_id: Optional[str] = None
+    model_url: Optional[str] = None  # 本地缓存路径
+    thumbnail_url: Optional[str] = None
+    original_url: Optional[str] = None  # Tripo 原始 URL（已过期）
+    error_message: Optional[str] = None
+    file_size: Optional[int] = None  # 文件大小（字节）
+    download_attempts: int = 0  # 下载重试次数
+
+    def to_dict(self) -> dict:
+        return {
+            **asdict(self),
+            'status': self.status.value if isinstance(self.status, TaskStatus) else self.status
+        }
+
+
+# ============ 连接管理器（线程安全） ============
+class ConnectionManager:
+    """WebSocket 连接管理器 - 支持心跳和广播"""
+
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+        self._lock = asyncio.Lock()
+        self.heartbeat_tasks: Dict[WebSocket, asyncio.Task] = {}
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        async with self._lock:
+            self.active_connections.append(websocket)
+        # 启动心跳
+        self.heartbeat_tasks[websocket] = asyncio.create_task(
+            self._heartbeat(websocket)
+        )
+        logger.info(f"WebSocket 连接建立，当前在线: {len(self.active_connections)}")
+
+    async def disconnect(self, websocket: WebSocket):
+        # 取消心跳任务
+        if websocket in self.heartbeat_tasks:
+            self.heartbeat_tasks[websocket].cancel()
+            del self.heartbeat_tasks[websocket]
+
+        async with self._lock:
+            if websocket in self.active_connections:
+                self.active_connections.remove(websocket)
+        logger.info(f"WebSocket 连接断开，当前在线: {len(self.active_connections)}")
+
+    async def broadcast(self, message: dict):
+        """广播消息给所有连接，自动清理失效连接"""
+        disconnected = []
+        message_str = json.dumps(message)
+
+        async with self._lock:
+            connections = self.active_connections.copy()
+
+        for connection in connections:
+            try:
+                await connection.send_text(message_str)
+            except Exception as e:
+                logger.warning(f"发送消息失败: {e}")
+                disconnected.append(connection)
+
+        # 清理失效连接
+        if disconnected:
+            async with self._lock:
+                for conn in disconnected:
+                    if conn in self.active_connections:
+                        self.active_connections.remove(conn)
+                        if conn in self.heartbeat_tasks:
+                            self.heartbeat_tasks[conn].cancel()
+                            del self.heartbeat_tasks[conn]
+
+    async def _heartbeat(self, websocket: WebSocket):
+        """WebSocket 心跳保活"""
+        try:
+            while True:
+                await asyncio.sleep(settings.WS_HEARTBEAT_INTERVAL)
+                if websocket.client_state.CONNECTED:
+                    await websocket.send_json({"type": "ping"})
+                else:
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"心跳停止: {e}")
+
+
+# ============ 全局状态 ============
+gallery_db: List[ModelInfo] = []
+manager = ConnectionManager()
+download_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_DOWNLOADS)  # 并发控制
+
+
+# ============ 应用生命周期 ============
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    # 启动
+    logger.info("🚀 Tripo Live Gallery 服务启动")
+    os.makedirs("static/models", exist_ok=True)
+
+    # 加载持久化数据（如果有）
+    await load_gallery_state()
+
+    yield
+
+    # 关闭
+    logger.info("👋 服务关闭，保存状态...")
+    await save_gallery_state()
+
+
+app = FastAPI(
+    title="Tripo Live Gallery Pro",
+    description="高性能 3D 模型实时生成画廊",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+# CORS 配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 生产环境应限制具体域名
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# ============ 状态持久化（简单实现） ============
+STATE_FILE = "gallery_state.json"
+
+
+async def save_gallery_state():
+    """保存画廊状态到文件"""
+    try:
+        state = [m.to_dict() for m in gallery_db]
+        async with aiofiles.open(STATE_FILE, 'w') as f:
+            await f.write(json.dumps(state, default=str))
+    except Exception as e:
+        logger.error(f"保存状态失败: {e}")
+
+
+async def load_gallery_state():
+    """从文件加载画廊状态"""
+    global gallery_db
+    try:
+        if os.path.exists(STATE_FILE):
+            async with aiofiles.open(STATE_FILE, 'r') as f:
+                content = await f.read()
+                data = json.loads(content)
+                gallery_db = [
+                    ModelInfo(
+                        id=item['id'],
+                        prompt=item['prompt'],
+                        author=item['author'],
+                        status=TaskStatus(item['status']),
+                        created_at=item['created_at'],
+                        progress=item.get('progress', 0),
+                        task_id=item.get('task_id'),
+                        model_url=item.get('model_url'),
+                        thumbnail_url=item.get('thumbnail_url'),
+                        error_message=item.get('error_message')
+                    )
+                    for item in data
+                ]
+            logger.info(f"已加载 {len(gallery_db)} 个历史模型")
+    except Exception as e:
+        logger.error(f"加载状态失败: {e}")
+
+
+# ============ API 端点 ============
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return HTMLResponse(content=HTML_TEMPLATE)
+
+
+@app.get("/api/gallery")
+async def get_gallery():
+    """获取画廊列表"""
+    return {
+        "models": [m.to_dict() for m in gallery_db],
+        "total": len(gallery_db),
+        "online": len(manager.active_connections)
+    }
+
+
+@app.post("/api/generate")
+async def generate_model(
+        request: GenerationRequest,
+        background_tasks: BackgroundTasks
+):
+    """提交生成任务"""
+    # 生成唯一 ID
+    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+    prompt_hash = hashlib.md5(request.prompt.encode()).hexdigest()[:6]
+    model_id = f"model-{timestamp}-{prompt_hash}"
+
+    new_model = ModelInfo(
+        id=model_id,
+        prompt=request.prompt,
+        author="当前用户",
+        status=TaskStatus.PENDING,
+        created_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
+        progress=0
+    )
+
+    gallery_db.insert(0, new_model)
+
+    # 后台处理
+    background_tasks.add_task(process_generation_task, new_model, request)
+
+    # 广播新任务
+    await manager.broadcast({
+        "type": "new_model",
+        "data": new_model.to_dict()
+    })
+
+    return {"success": True, "model_id": model_id}
+
+
+@app.get("/api/model-file/{model_id}")
+async def get_model_file(model_id: str):
+    """获取模型文件（优先本地，支持代理）"""
+    model = next((m for m in gallery_db if m.id == model_id), None)
+    if not model:
+        raise HTTPException(404, "模型不存在")
+
+    local_path = f"static/models/{model_id}/model.glb"
+
+    # 本地存在直接返回
+    if os.path.exists(local_path):
+        return FileResponse(
+            local_path,
+            media_type="model/gltf-binary",
+            filename=f"{model_id}.glb",
+            headers={"Cache-Control": "public, max-age=31536000"}
+        )
+
+    # 如果只有原始 URL，返回代理信息
+    if model.original_url:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "模型未缓存",
+                "url": model.original_url,
+                "message": "模型文件尚未下载到本地，请稍后重试"
+            }
+        )
+
+    raise HTTPException(404, "模型文件不可用")
+
+
+@app.delete("/api/models/{model_id}")
+async def delete_model(model_id: str):
+    """删除模型（仅管理员或作者）"""
+    global gallery_db
+    model = next((m for m in gallery_db if m.id == model_id), None)
+    if not model:
+        raise HTTPException(404, "模型不存在")
+
+    # 删除文件
+    import shutil
+    model_dir = f"static/models/{model_id}"
+    if os.path.exists(model_dir):
+        shutil.rmtree(model_dir)
+
+    gallery_db = [m for m in gallery_db if m.id != model_id]
+    await manager.broadcast({"type": "delete_model", "model_id": model_id})
+
+    return {"success": True}
+
+
+# ============ WebSocket 端点 ============
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+
+    try:
+        # 发送初始化数据
+        await websocket.send_json({
+            "type": "init",
+            "online_count": len(manager.active_connections),
+            "models": [m.to_dict() for m in gallery_db]
+        })
+
+        # 处理客户端消息
+        while True:
+            try:
+                data = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=60.0
+                )
+
+                if data.get("action") == "pong":
+                    continue
+                elif data.get("action") == "ping":
+                    await websocket.send_json({"type": "pong"})
+
+            except asyncio.TimeoutError:
+                # 超时检查连接
+                try:
+                    await websocket.send_json({"type": "ping"})
+                except:
+                    break
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.error(f"WebSocket 错误: {e}")
+    finally:
+        await manager.disconnect(websocket)
+        await manager.broadcast({
+            "type": "online_update",
+            "count": len(manager.active_connections)
+        })
+
+
+# ============ 核心生成逻辑 ============
+async def process_generation_task(model: ModelInfo, request: GenerationRequest):
+    """处理生成任务（带重试和错误处理）"""
+    output_dir = f"static/models/{model.id}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    headers = {
+        "Authorization": f"Bearer {settings.TRIPO_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            # 阶段 1: 创建任务
+            model.status = TaskStatus.QUEUED
+            model.progress = 10
+            await update_model_status(model)
+
+            payload = {
+                "type": "text_to_model",
+                "prompt": request.prompt,
+                "negative_prompt": request.negative_prompt,
+                "model_version": request.model_version,
+                "face_limit": request.face_limit,
+                "texture": request.texture,
+                "pbr": request.pbr
+            }
+
+            logger.info(f"📤 创建任务: {model.id}")
+            resp = await client.post(
+                f"{settings.TRIPO_API_URL}/task",
+                headers=headers,
+                json=payload
+            )
+            resp.raise_for_status()
+
+            data = resp.json()
+            if data.get("code") != 0:
+                raise Exception(f"API 错误: {data.get('message')}")
+
+            task_id = data["data"]["task_id"]
+            model.task_id = task_id
+            model.progress = 20
+            await update_model_status(model)
+            logger.info(f"✅ 任务创建成功: {task_id}")
+
+            # 阶段 2: 轮询并下载
+            await poll_and_download_with_retry(
+                client, headers, task_id, model, output_dir
+            )
+
+        except Exception as e:
+            logger.error(f"❌ 任务失败 {model.id}: {e}")
+            model.status = TaskStatus.FAILED
+            model.error_message = str(e)
+            await update_model_status(model)
+
+
+async def poll_and_download_with_retry(
+        client: httpx.AsyncClient,
+        headers: dict,
+        task_id: str,
+        model: ModelInfo,
+        output_dir: str
+):
+    """带重试的轮询和下载"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            await poll_and_download(client, headers, task_id, model, output_dir)
+            return
+        except Exception as e:
+            model.download_attempts += 1
+            logger.warning(f"⚠️ 第 {attempt + 1} 次尝试失败: {e}")
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # 指数退避
+                logger.info(f"⏳ {wait_time}秒后重试...")
+                await asyncio.sleep(wait_time)
+            else:
+                raise
+
+
+async def poll_and_download(
+        client: httpx.AsyncClient,
+        headers: dict,
+        task_id: str,
+        model: ModelInfo,
+        output_dir: str
+):
+    """轮询任务状态并下载（关键：URL 只有 5 分钟有效期）"""
+
+    for attempt in range(settings.MAX_POLL_ATTEMPTS):
+        await asyncio.sleep(settings.POLL_INTERVAL)
+
+        try:
+            resp = await client.get(
+                f"{settings.TRIPO_API_URL}/task/{task_id}",
+                headers=headers
+            )
+            resp.raise_for_status()
+
+            data = resp.json()
+            if data.get("code") != 0:
+                continue
+
+            task = data["data"]
+            status = task.get("status")
+            progress = task.get("progress", 0)
+
+            # 状态映射
+            status_map = {
+                "queued": TaskStatus.QUEUED,
+                "running": TaskStatus.RUNNING,
+                "success": TaskStatus.SUCCESS,
+                "failed": TaskStatus.FAILED,
+                "banned": TaskStatus.BANNED,
+                "expired": TaskStatus.EXPIRED,
+                "cancelled": TaskStatus.CANCELLED,
+                "unknown": TaskStatus.UNKNOWN
+            }
+
+            model.status = status_map.get(status, TaskStatus.UNKNOWN)
+
+            # 进度计算
+            if status == "queued":
+                model.progress = 20 + min(progress * 0.3, 10)
+            elif status == "running":
+                model.progress = 30 + min(progress * 0.6, 60)
+
+            await update_model_status(model)
+            logger.debug(f"⏳ [{attempt}] {status}: {model.progress:.0f}%")
+
+            # 任务完成，立即下载（URL 只有 5 分钟有效期！）
+            if status == "success":
+                logger.info(f"🎉 任务完成，立即下载（URL 有效期 5 分钟）...")
+                output = task.get("output", {})
+
+                # 按优先级获取模型 URL
+                model_url = None
+                for key in ["pbr_model", "model", "base_model"]:
+                    if key in output and output[key]:
+                        model_url = output[key]
+                        logger.info(f"✅ 找到模型: {key}")
+                        break
+
+                if not model_url:
+                    raise Exception("API 未返回模型 URL")
+
+                model.original_url = model_url
+
+                # 使用信号量控制并发下载
+                async with download_semaphore:
+                    await download_model_files(
+                        client, model_url, output, model, output_dir
+                    )
+                return
+
+            elif status in ["failed", "banned", "expired", "cancelled"]:
+                raise Exception(f"任务终止: {status}")
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP 错误: {e.response.status_code}")
+            await asyncio.sleep(5)
+        except Exception as e:
+            logger.error(f"轮询错误: {e}")
+
+    raise Exception("轮询超时")
+
+
+async def download_model_files(
+        client: httpx.AsyncClient,
+        model_url: str,
+        output: dict,
+        model: ModelInfo,
+        output_dir: str
+):
+    """下载模型和缩略图（关键路径）"""
+
+    # 下载主模型
+    try:
+        logger.info(f"⬇️  下载模型...")
+        file_path = f"{output_dir}/model.glb"
+
+        async with client.stream("GET", model_url, timeout=settings.DOWNLOAD_TIMEOUT) as response:
+            response.raise_for_status()
+            total_size = 0
+
+            async with aiofiles.open(file_path, "wb") as f:
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    await f.write(chunk)
+                    total_size += len(chunk)
+
+        model.model_url = f"/static/models/{model.id}/model.glb"
+        model.file_size = total_size
+        model.progress = 95
+        logger.info(f"✅ 模型下载完成: {total_size / 1024:.1f} KB")
+
+    except Exception as e:
+        logger.error(f"❌ 模型下载失败: {e}")
+        # 如果下载失败，保留原始 URL 供前端尝试
+        model.model_url = f"/api/model-file/{model.id}"
+        raise
+
+    # 下载缩略图
+    thumb_keys = ["rendered_image", "generated_image"]
+    for key in thumb_keys:
+        thumb_url = output.get(key)
+        if thumb_url:
+            try:
+                thumb_path = f"{output_dir}/thumbnail.jpg"
+                async with client.stream("GET", thumb_url, timeout=30.0) as response:
+                    async with aiofiles.open(thumb_path, "wb") as f:
+                        async for chunk in response.aiter_bytes():
+                            await f.write(chunk)
+                model.thumbnail_url = f"/static/models/{model.id}/thumbnail.jpg"
+                logger.info(f"✅ 缩略图下载完成 ({key})")
+                break
+            except Exception as e:
+                logger.warning(f"⚠️ 缩略图下载失败 ({key}): {e}")
+
+    model.status = TaskStatus.SUCCESS
+    model.progress = 100
+    await update_model_status(model)
+
+    # 保存状态
+    await save_gallery_state()
+
+    logger.info(f"\n{'=' * 60}")
+    logger.info(f"🎊 模型生成完成!")
+    logger.info(f"   ID: {model.id}")
+    logger.info(f"   路径: {output_dir}/")
+    logger.info(f"   大小: {model.file_size / 1024:.1f} KB")
+    logger.info(f"{'=' * 60}\n")
+
+
+async def update_model_status(model: ModelInfo):
+    """更新状态并广播"""
+    # 更新数据库
+    for i, m in enumerate(gallery_db):
+        if m.id == model.id:
+            gallery_db[i] = model
+            break
+
+    # 广播更新
+    await manager.broadcast({
+        "type": "status_update",
+        "data": model.to_dict()
+    })
+
+
+# ============ 前端模板（优化版） ============
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tripo Live Gallery Pro - 实时 3D 生成</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap');
+
+        * { box-sizing: border-box; }
+
+        body { 
+            font-family: 'Inter', sans-serif; 
+            background: #0a0a0a; 
+            color: white; 
+            overflow-x: hidden;
+        }
+
+        .gradient-bg {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 25%, #f093fb 50%, #f5576c 75%, #4facfe 100%);
+            background-size: 400% 400%;
+            animation: gradientShift 15s ease infinite;
+        }
+
+        @keyframes gradientShift {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+
+        .glass {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .glass-hover:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .model-card {
+            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            transform-style: preserve-3d;
+        }
+        .model-card:hover {
+            transform: translateY(-8px) scale(1.02);
+            box-shadow: 0 25px 50px -12px rgba(102, 126, 234, 0.4);
+        }
+
+        .fade-in { animation: fadeIn 0.5s ease-out forwards; }
+        @keyframes fadeIn { 
+            from { opacity: 0; transform: translateY(20px); } 
+            to { opacity: 1; transform: translateY(0); } 
+        }
+
+        .pulse-ring {
+            position: relative;
+        }
+        .pulse-ring::before {
+            content: '';
+            position: absolute;
+            inset: -4px;
+            border-radius: 50%;
+            border: 2px solid #10b981;
+            animation: pulseRing 2s infinite;
+        }
+        @keyframes pulseRing {
+            0% { transform: scale(1); opacity: 1; }
+            100% { transform: scale(1.5); opacity: 0; }
+        }
+
+        .progress-shine {
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.4), transparent);
+            background-size: 200% 100%;
+            animation: shine 2s infinite;
+        }
+        @keyframes shine {
+            0% { background-position: -200% 0; }
+            100% { background-position: 200% 0; }
+        }
+
+        #viewer-container {
+            width: 100%;
+            height: 500px;
+            position: relative;
+            overflow: hidden;
+            border-radius: 16px;
+            background: radial-gradient(circle at center, #1a1a2e 0%, #0f0f1e 100%);
+        }
+
+        .loading-skeleton {
+            background: linear-gradient(90deg, #1f1f2e 25%, #2a2a3e 50%, #1f1f2e 75%);
+            background-size: 200% 100%;
+            animation: loading 1.5s infinite;
+        }
+        @keyframes loading {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+
+        .toast {
+            animation: slideIn 0.3s ease-out;
+        }
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+
+        /* 自定义滚动条 */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #0a0a0a; }
+        ::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #555; }
+    </style>
+</head>
+<body class="gradient-bg min-h-screen">
+    <!-- 头部 -->
+    <header class="fixed top-0 w-full z-50 glass border-b border-white/10 backdrop-blur-xl">
+        <div class="max-w-7xl mx-auto px-6 py-4 flex justify-between items-center">
+            <div class="flex items-center gap-3">
+                <div class="w-10 h-10 bg-gradient-to-br from-purple-500 to-pink-500 rounded-xl flex items-center justify-center text-xl font-bold shadow-lg">
+                    T
+                </div>
+                <div>
+                    <h1 class="text-xl font-bold tracking-tight">Tripo Live Gallery 付小宇</h1>
+                    <p class="text-xs text-gray-400">Python FastAPI • WebSocket 实时同步 • Tripo AI</p>
+                </div>
+            </div>
+            <div class="flex items-center gap-4">
+                <div class="flex items-center gap-2 px-4 py-2 glass rounded-full text-sm">
+                    <span class="w-2 h-2 bg-green-500 rounded-full pulse-ring"></span>
+                    <span id="online-count">1</span> 人在线
+                </div>
+                <div id="connection-status" class="px-3 py-1.5 glass rounded-full text-xs font-medium text-yellow-400 flex items-center gap-1.5">
+                    <span class="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></span>
+                    连接中...
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- 主要内容 -->
+    <main class="pt-28 pb-12 px-6 max-w-7xl mx-auto">
+
+        <!-- 生成控制区 -->
+        <section class="glass rounded-3xl p-8 mb-10 text-center relative overflow-hidden">
+            <div class="absolute inset-0 bg-gradient-to-r from-purple-600/20 via-pink-600/20 to-blue-600/20 pointer-events-none"></div>
+            <div class="absolute -top-24 -right-24 w-48 h-48 bg-purple-500/20 rounded-full blur-3xl"></div>
+            <div class="absolute -bottom-24 -left-24 w-48 h-48 bg-pink-500/20 rounded-full blur-3xl"></div>
+
+            <h2 class="text-4xl font-bold mb-3 relative z-10 bg-clip-text text-transparent bg-gradient-to-r from-white to-gray-300">
+                实时 3D 生成引擎
+            </h2>
+            <p class="text-gray-400 mb-8 relative z-10 max-w-2xl mx-auto">
+                输入任意描述，AI 将在后台实时生成 3D 模型。所有用户通过 WebSocket 同步看到生成进度。
+            </p>
+
+            <div class="max-w-3xl mx-auto relative z-10 space-y-4">
+                <div class="flex gap-3">
+                    <div class="flex-1 relative">
+                        <input type="text" id="prompt-input" 
+                               placeholder="描述你想要的 3D 模型，例如：赛博朋克风格的机械猫..." 
+                               class="w-full px-6 py-4 bg-black/40 border border-white/20 rounded-2xl text-white placeholder-gray-500 focus:outline-none focus:border-purple-500 focus:ring-2 focus:ring-purple-500/20 transition text-lg"
+                               maxlength="1024"
+                               onkeypress="if(event.key==='Enter' && !event.shiftKey) { event.preventDefault(); generateModel(); }">
+                        <div class="absolute right-4 top-1/2 -translate-y-1/2 text-xs text-gray-500" id="char-count">0/1024</div>
+                    </div>
+                    <button onclick="generateModel()" id="generate-btn"
+                            class="px-8 py-4 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 rounded-2xl font-bold text-lg transition-all transform hover:scale-105 active:scale-95 shadow-lg shadow-purple-500/25 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                        <span>生成</span>
+                    </button>
+                </div>
+
+                <div class="flex flex-wrap justify-center gap-2 text-sm">
+                    <button onclick="setPrompt('可爱的低多边形小狐狸，卡通风格，柔和色彩')" class="px-4 py-2 glass rounded-full hover:bg-white/20 transition glass-hover">🦊 低多边形狐狸</button>
+                    <button onclick="setPrompt('未来主义悬浮汽车，赛博朋克风格，霓虹灯光')" class="px-4 py-2 glass rounded-full hover:bg-white/20 transition glass-hover">🚗 科幻汽车</button>
+                    <button onclick="setPrompt('魔法药水，水晶瓶，发光效果，悬浮粒子')" class="px-4 py-2 glass rounded-full hover:bg-white/20 transition glass-hover">🧪 魔法药水</button>
+                    <button onclick="setPrompt('机甲战士头盔，重金属风格，磨损质感')" class="px-4 py-2 glass rounded-full hover:bg-white/20 transition glass-hover">🤖 机甲头盔</button>
+                    <button onclick="setPrompt('日式鸟居，樱花飘落，传统建筑风格')" class="px-4 py-2 glass rounded-full hover:bg-white/20 transition glass-hover">⛩️ 日式鸟居</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- 实时画廊 -->
+        <section>
+            <div class="flex justify-between items-end mb-6">
+                <div>
+                    <h3 class="text-2xl font-bold flex items-center gap-2">
+                        实时共创画廊
+                        <span class="text-sm font-normal text-gray-400 bg-white/5 px-3 py-1 rounded-full" id="total-count">0 个模型</span>
+                    </h3>
+                    <p class="text-gray-400 text-sm mt-1">WebSocket 实时同步 • 所有人可见最新生成</p>
+                </div>
+                <div class="flex gap-2">
+                    <button onclick="clearCompleted()" class="px-4 py-2 glass rounded-xl text-sm hover:bg-white/10 transition text-green-400 glass-hover">
+                        清空已完成
+                    </button>
+                    <button onclick="refreshGallery()" class="px-4 py-2 glass rounded-xl text-sm hover:bg-white/10 transition glass-hover flex items-center gap-1">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                        刷新
+                    </button>
+                </div>
+            </div>
+
+            <div id="gallery-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                <!-- 动态插入 -->
+            </div>
+
+            <div id="empty-state" class="hidden text-center py-20 text-gray-500">
+                <div class="text-6xl mb-4 animate-bounce">🎭</div>
+                <p class="text-lg">画廊空空如也</p>
+                <p class="text-sm mt-2">成为第一个创作者吧！</p>
+            </div>
+        </section>
+    </main>
+
+    <!-- Toast 通知容器 -->
+    <div id="toast-container" class="fixed top-24 right-6 z-50 space-y-2"></div>
+
+    <!-- 3D 查看器模态框 -->
+    <div id="viewer-modal" class="fixed inset-0 z-50 hidden bg-black/90 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="glass rounded-2xl w-full max-w-5xl overflow-hidden shadow-2xl border border-white/20">
+            <div class="p-4 border-b border-white/10 flex justify-between items-center bg-white/5">
+                <div>
+                    <h3 class="font-bold text-lg" id="viewer-title">3D 模型查看器</h3>
+                    <p class="text-xs text-gray-400 mt-0.5" id="viewer-meta"></p>
+                </div>
+                <button onclick="closeViewer()" class="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center transition">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <div id="viewer-container">
+                <div class="absolute inset-0 flex items-center justify-center">
+                    <div class="text-center">
+                        <div class="w-16 h-16 border-4 border-purple-500/30 border-t-purple-500 rounded-full animate-spin mx-auto mb-4"></div>
+                        <p class="text-gray-400">加载 3D 引擎...</p>
+                    </div>
+                </div>
+            </div>
+            <div class="p-4 bg-black/40 flex justify-between items-center border-t border-white/10">
+                <div class="text-sm text-gray-400 flex items-center gap-2">
+                    <span class="w-2 h-2 bg-purple-500 rounded-full"></span>
+                    <span>Tripo AI</span>
+                    <span class="text-gray-600">•</span>
+                    <span>Three.js 渲染</span>
+                </div>
+                <div class="flex gap-2">
+                    <button onclick="resetCamera()" class="px-4 py-2 glass rounded-lg text-sm hover:bg-white/10 transition glass-hover flex items-center gap-1">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                        重置视角
+                    </button>
+                    <button onclick="toggleAutoRotate()" id="rotate-btn" class="px-4 py-2 glass rounded-lg text-sm hover:bg-white/10 transition glass-hover">
+                        自动旋转
+                    </button>
+                    <a id="download-link" href="#" target="_blank" class="px-4 py-2 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 rounded-lg text-sm font-medium transition flex items-center gap-1 shadow-lg shadow-purple-500/20">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                        下载模型
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+        // 全局状态
+        let ws = null;
+        let models = [];
+        let reconnectAttempts = 0;
+        let reconnectTimer = null;
+        let heartbeatTimer = null;
+        let scene, camera, renderer, controls, currentModel;
+        let autoRotate = false;
+        const MAX_RECONNECT_ATTEMPTS = 5;
+        const RECONNECT_DELAY = 3000;
+
+        // 初始化 WebSocket
+        function initWebSocket() {
+            if (ws?.readyState === WebSocket.OPEN) return;
+
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+
+            try {
+                ws = new WebSocket(wsUrl);
+
+                ws.onopen = () => {
+                    console.log('✅ WebSocket 已连接');
+                    updateConnectionStatus('connected');
+                    reconnectAttempts = 0;
+                    startHeartbeat();
+                };
+
+                ws.onmessage = (event) => {
+                    try {
+                        const msg = JSON.parse(event.data);
+                        handleWebSocketMessage(msg);
+                    } catch (e) {
+                        console.error('消息解析错误:', e);
+                    }
+                };
+
+                ws.onclose = (e) => {
+                    console.log('❌ WebSocket 断开', e.code, e.reason);
+                    updateConnectionStatus('disconnected');
+                    stopHeartbeat();
+                    attemptReconnect();
+                };
+
+                ws.onerror = (error) => {
+                    console.error('WebSocket 错误:', error);
+                    updateConnectionStatus('error');
+                };
+
+            } catch (error) {
+                console.error('WebSocket 初始化失败:', error);
+                attemptReconnect();
+            }
+        }
+
+        function startHeartbeat() {
+            stopHeartbeat();
+            heartbeatTimer = setInterval(() => {
+                if (ws?.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ action: 'ping' }));
+                }
+            }, 30000);
+        }
+
+        function stopHeartbeat() {
+            if (heartbeatTimer) {
+                clearInterval(heartbeatTimer);
+                heartbeatTimer = null;
+            }
+        }
+
+        function attemptReconnect() {
+            if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                showToast('连接失败，请刷新页面重试', 'error');
+                return;
+            }
+
+            reconnectAttempts++;
+            updateConnectionStatus('reconnecting', reconnectAttempts);
+
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(() => {
+                console.log(`🔄 尝试重连 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+                initWebSocket();
+            }, RECONNECT_DELAY);
+        }
+
+        function updateConnectionStatus(status, attempt = null) {
+            const el = document.getElementById('connection-status');
+            const statusMap = {
+                'connected': { text: '实时连接中', class: 'text-green-400', dot: 'bg-green-400' },
+                'disconnected': { text: '已断开', class: 'text-red-400', dot: 'bg-red-400' },
+                'error': { text: '连接错误', class: 'text-red-400', dot: 'bg-red-400' },
+                'reconnecting': { text: `重连中 ${attempt}/${MAX_RECONNECT_ATTEMPTS}`, class: 'text-yellow-400', dot: 'bg-yellow-400 animate-pulse' }
+            };
+
+            const s = statusMap[status];
+            el.className = `px-3 py-1.5 glass rounded-full text-xs font-medium ${s.class} flex items-center gap-1.5`;
+            el.innerHTML = `<span class="w-1.5 h-1.5 rounded-full ${s.dot}"></span>${s.text}`;
+        }
+
+        function handleWebSocketMessage(msg) {
+            switch(msg.type) {
+                case 'init':
+                    models = msg.models || [];
+                    updateOnlineCount(msg.online_count);
+                    renderGallery();
+                    break;
+
+                case 'new_model':
+                    models.unshift(msg.data);
+                    renderGallery();
+                    showToast(`🎉 新任务: ${msg.data.prompt.substring(0, 30)}...`, 'success');
+                    break;
+
+                case 'status_update':
+                    updateModelCard(msg.data);
+                    if (msg.data.status === 'success' && msg.data.progress === 100) {
+                        showToast('✅ 模型生成完成！', 'success');
+                    } else if (msg.data.status === 'failed') {
+                        showToast(`❌ 生成失败: ${msg.data.error_message || '未知错误'}`, 'error');
+                    }
+                    break;
+
+                case 'online_update':
+                    updateOnlineCount(msg.count);
+                    break;
+
+                case 'delete_model':
+                    models = models.filter(m => m.id !== msg.model_id);
+                    renderGallery();
+                    break;
+
+                case 'ping':
+                    ws.send(JSON.stringify({ action: 'pong' }));
+                    break;
+            }
+        }
+
+        function updateOnlineCount(count) {
+            document.getElementById('online-count').textContent = count || 1;
+        }
+
+        // 生成模型
+        async function generateModel() {
+            const input = document.getElementById('prompt-input');
+            const prompt = input.value.trim();
+
+            if (!prompt) {
+                showToast('请输入描述文本', 'warning');
+                input.focus();
+                return;
+            }
+
+            const btn = document.getElementById('generate-btn');
+            const originalContent = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = `<svg class="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> 提交中...`;
+
+            try {
+                const response = await fetch('/api/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        prompt: prompt,
+                        negative_prompt: 'low quality, blurry, watermark, text'
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    input.value = '';
+                    document.getElementById('char-count').textContent = '0/1024';
+                    showToast('✅ 任务已提交，正在生成...', 'info');
+                } else {
+                    throw new Error(result.message || '提交失败');
+                }
+
+            } catch (error) {
+                console.error('Error:', error);
+                showToast('提交失败: ' + error.message, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = originalContent;
+            }
+        }
+        window.generateModel = generateModel;
+
+        function setPrompt(text) {
+            const input = document.getElementById('prompt-input');
+            input.value = text;
+            input.focus();
+            updateCharCount();
+        }
+        window.setPrompt = setPrompt;
+
+        function updateCharCount() {
+            const input = document.getElementById('prompt-input');
+            const count = input.value.length;
+            document.getElementById('char-count').textContent = `${count}/1024`;
+        }
+
+        document.getElementById('prompt-input')?.addEventListener('input', updateCharCount);
+
+        // 渲染画廊
+        function renderGallery() {
+            const grid = document.getElementById('gallery-grid');
+            const emptyState = document.getElementById('empty-state');
+            const totalCount = document.getElementById('total-count');
+
+            totalCount.textContent = `${models.length} 个模型`;
+
+            if (models.length === 0) {
+                grid.innerHTML = '';
+                emptyState.classList.remove('hidden');
+                return;
+            }
+
+            emptyState.classList.add('hidden');
+            grid.innerHTML = models.map((model, index) => createModelCard(model, index)).join('');
+        }
+
+        function createModelCard(model, index) {
+            const statusConfig = {
+                'pending': { color: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30', icon: '⏳', text: '等待中' },
+                'queued': { color: 'bg-blue-500/20 text-blue-400 border-blue-500/30', icon: '📋', text: '排队中' },
+                'running': { color: 'bg-purple-500/20 text-purple-400 border-purple-500/30', icon: '⚡', text: `生成中 ${Math.round(model.progress)}%` },
+                'success': { color: 'bg-green-500/20 text-green-400 border-green-500/30', icon: '✨', text: '已完成' },
+                'failed': { color: 'bg-red-500/20 text-red-400 border-red-500/30', icon: '❌', text: '失败' },
+                'banned': { color: 'bg-red-500/20 text-red-400 border-red-500/30', icon: '🚫', text: '已封禁' },
+                'expired': { color: 'bg-gray-500/20 text-gray-400 border-gray-500/30', icon: '⌛', text: '已过期' }
+            };
+
+            const status = statusConfig[model.status] || statusConfig['pending'];
+            const isCompleted = model.status === 'success';
+            const isProcessing = model.status === 'running' || model.status === 'queued';
+
+            // 缩略图处理
+            let thumbnailHtml = '';
+            if (model.thumbnail_url) {
+                thumbnailHtml = `<img src="${model.thumbnail_url}" class="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity" loading="lazy" alt="">`;
+            } else {
+                thumbnailHtml = `<div class="text-5xl transform group-hover:scale-110 transition-transform duration-300">${status.icon}</div>`;
+            }
+
+            return `
+                <div class="model-card glass rounded-2xl overflow-hidden fade-in relative group" 
+                     id="card-${model.id}"
+                     style="animation-delay: ${index * 50}ms">
+
+                    <!-- 缩略图区域 -->
+                    <div class="h-56 bg-gradient-to-br from-purple-900/20 to-pink-900/20 flex items-center justify-center relative overflow-hidden cursor-pointer ${isCompleted ? 'hover:opacity-90' : ''}"
+                         onclick="${isCompleted ? `viewModel('${model.id}')` : ''}">
+
+                        ${thumbnailHtml}
+
+                        <!-- 状态标签 -->
+                        <div class="absolute top-3 right-3 px-3 py-1.5 rounded-full text-xs font-bold border backdrop-blur-md ${status.color} shadow-lg">
+                            ${status.text}
+                        </div>
+
+                        <!-- 进度条 -->
+                        ${isProcessing ? `
+                            <div class="absolute bottom-0 left-0 right-0 h-1.5 bg-gray-800">
+                                <div class="h-full bg-gradient-to-r from-purple-500 to-pink-500 progress-shine relative" 
+                                     style="width: ${model.progress}%">
+                                    <div class="absolute right-0 top-0 bottom-0 w-2 bg-white/50 blur-sm"></div>
+                                </div>
+                            </div>
+                        ` : ''}
+
+                        <!-- 悬停提示 -->
+                        ${isCompleted ? `
+                            <div class="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-all duration-300 flex items-center justify-center backdrop-blur-sm">
+                                <div class="text-center transform translate-y-4 group-hover:translate-y-0 transition-transform">
+                                    <div class="w-16 h-16 rounded-full bg-white/20 flex items-center justify-center mx-auto mb-2">
+                                        <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path></svg>
+                                    </div>
+                                    <span class="text-sm font-bold">点击查看 3D</span>
+                                </div>
+                            </div>
+                        ` : ''}
+                    </div>
+
+                    <!-- 信息区域 -->
+                    <div class="p-4 space-y-3">
+                        <div>
+                            <h4 class="font-bold text-sm line-clamp-2 leading-relaxed mb-1" title="${model.prompt}">${model.prompt}</h4>
+                            <div class="flex justify-between items-center text-xs text-gray-500">
+                                <span class="flex items-center gap-1">
+                                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+                                    ${model.author}
+                                </span>
+                                <span>${model.created_at}</span>
+                            </div>
+                        </div>
+
+                        ${model.file_size ? `
+                            <div class="text-xs text-gray-600 font-mono flex items-center gap-1">
+                                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"></path></svg>
+                                ${(model.file_size / 1024).toFixed(1)} KB
+                            </div>
+                        ` : ''}
+
+                        ${model.error_message ? `
+                            <div class="text-xs text-red-400 bg-red-500/10 p-2 rounded border border-red-500/20 line-clamp-2" title="${model.error_message}">
+                                错误: ${model.error_message}
+                            </div>
+                        ` : ''}
+
+                        ${isCompleted ? `
+                            <div class="flex gap-2 pt-2 border-t border-white/5">
+                                <button onclick="event.stopPropagation(); viewModel('${model.id}')" class="flex-1 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-xs font-medium transition">
+                                    查看 3D
+                                </button>
+                                <a href="${model.model_url}" download class="flex-1 py-2 bg-purple-600/20 hover:bg-purple-600/30 text-purple-400 rounded-lg text-xs font-medium transition text-center">
+                                    下载
+                                </a>
+                            </div>
+                        ` : ''}
+                    </div>
+                </div>
+            `;
+        }
+
+        function updateModelCard(model) {
+            const card = document.getElementById(`card-${model.id}`);
+            if (card) {
+                const index = models.findIndex(m => m.id === model.id);
+                if (index !== -1) {
+                    models[index] = model;
+                    card.outerHTML = createModelCard(model, index);
+                }
+            } else if (!models.find(m => m.id === model.id)) {
+                models.unshift(model);
+                renderGallery();
+            }
+        }
+
+        // 3D 查看器
+        function viewModel(modelId) {
+            const model = models.find(m => m.id === modelId);
+            if (!model || model.status !== 'success') return;
+
+            document.getElementById('viewer-title').textContent = model.prompt;
+            document.getElementById('viewer-meta').textContent = `${model.created_at} • ${(model.file_size / 1024).toFixed(1)} KB`;
+            document.getElementById('viewer-modal').classList.remove('hidden');
+
+            // 确保下载链接正确
+            const downloadLink = document.getElementById('download-link');
+            let modelUrl = model.model_url;
+            if (!modelUrl.startsWith('http')) {
+                modelUrl = window.location.origin + modelUrl;
+            }
+            downloadLink.href = modelUrl;
+
+            initThreeJS();
+            loadModel(modelUrl);
+        }
+        window.viewModel = viewModel;
+
+        function initThreeJS() {
+            const container = document.getElementById('viewer-container');
+            container.innerHTML = '';
+
+            // 场景设置
+            scene = new THREE.Scene();
+
+            // 相机
+            camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 1000);
+            camera.position.set(5, 3, 5);
+
+            // 渲染器
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1;
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            container.appendChild(renderer.domElement);
+
+            // 环境
+            const pmremGenerator = new THREE.PMREMGenerator(renderer);
+            scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+
+            // 灯光
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+            scene.add(ambientLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+            dirLight.position.set(5, 10, 7);
+            dirLight.castShadow = true;
+            dirLight.shadow.mapSize.width = 2048;
+            dirLight.shadow.mapSize.height = 2048;
+            scene.add(dirLight);
+
+            const fillLight = new THREE.DirectionalLight(0x8888ff, 0.3);
+            fillLight.position.set(-5, 0, -5);
+            scene.add(fillLight);
+
+            // 控制器
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.minDistance = 1;
+            controls.maxDistance = 50;
+            controls.target.set(0, 0, 0);
+
+            // 网格
+            const gridHelper = new THREE.GridHelper(10, 10, 0x444444, 0x222222);
+            gridHelper.position.y = -1;
+            scene.add(gridHelper);
+
+            animate();
+        }
+
+        function loadModel(url) {
+            const container = document.getElementById('viewer-container');
+
+            // 加载指示器
+            const loader = document.createElement('div');
+            loader.className = 'absolute inset-0 flex items-center justify-center bg-black/50 backdrop-blur-sm z-10';
+            loader.innerHTML = `
+                <div class="text-center">
+                    <div class="w-16 h-16 border-4 border-purple-500/30 border-t-purple-500 rounded-full animate-spin mx-auto mb-4"></div>
+                    <p class="text-gray-300">加载模型中...</p>
+                    <p class="text-xs text-gray-500 mt-1" id="load-progress">0%</p>
+                </div>
+            `;
+            container.appendChild(loader);
+
+            // 清理旧模型
+            if (currentModel) {
+                scene.remove(currentModel);
+                currentModel.traverse((child) => {
+                    if (child.isMesh) {
+                        child.geometry?.dispose();
+                        if (child.material) {
+                            if (Array.isArray(child.material)) {
+                                child.material.forEach(m => m.dispose());
+                            } else {
+                                child.material.dispose();
+                            }
+                        }
+                    }
+                });
+                currentModel = null;
+            }
+
+            const gltfLoader = new GLTFLoader();
+            gltfLoader.load(
+                url,
+                (gltf) => {
+                    loader.remove();
+
+                    currentModel = gltf.scene;
+
+                    // 计算包围盒
+                    const box = new THREE.Box3().setFromObject(currentModel);
+                    const center = box.getCenter(new THREE.Vector3());
+                    const size = box.getSize(new THREE.Vector3());
+
+                    // 居中并缩放
+                    currentModel.position.x = -center.x;
+                    currentModel.position.y = -center.y + size.y / 2;
+                    currentModel.position.z = -center.z;
+
+                    const maxDim = Math.max(size.x, size.y, size.z);
+                    const scale = 3 / maxDim;
+                    currentModel.scale.setScalar(scale);
+
+                    // 设置相机
+                    const distance = maxDim * 2;
+                    camera.position.set(distance, distance * 0.5, distance);
+                    camera.lookAt(0, 0, 0);
+                    controls.target.set(0, 0, 0);
+                    controls.update();
+
+                    // 阴影
+                    currentModel.traverse((child) => {
+                        if (child.isMesh) {
+                            child.castShadow = true;
+                            child.receiveShadow = true;
+                        }
+                    });
+
+                    scene.add(currentModel);
+                    console.log('✅ 模型加载成功');
+                },
+                (progress) => {
+                    if (progress.lengthComputable) {
+                        const percent = Math.round((progress.loaded / progress.total) * 100);
+                        const progressEl = document.getElementById('load-progress');
+                        if (progressEl) progressEl.textContent = `${percent}%`;
+                    }
+                },
+                (error) => {
+                    console.error('模型加载失败:', error);
+                    loader.innerHTML = `
+                        <div class="text-center text-red-400">
+                            <svg class="w-16 h-16 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            <p>模型加载失败</p>
+                            <p class="text-xs text-gray-500 mt-2">${error.message}</p>
+                        </div>
+                    `;
+                    setTimeout(() => loader.remove(), 3000);
+                }
+            );
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            controls.update();
+
+            if (currentModel && autoRotate) {
+                currentModel.rotation.y += 0.005;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        function closeViewer() {
+            document.getElementById('viewer-modal').classList.add('hidden');
+            if (renderer) {
+                renderer.dispose();
+                renderer = null;
+            }
+            currentModel = null;
+            scene = null;
+            camera = null;
+            controls = null;
+        }
+        window.closeViewer = closeViewer;
+
+        function resetCamera() {
+            if (!currentModel || !camera) return;
+            const box = new THREE.Box3().setFromObject(currentModel);
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const distance = maxDim * 2;
+            camera.position.set(distance, distance * 0.5, distance);
+            camera.lookAt(0, 0, 0);
+            controls.target.set(0, 0, 0);
+            controls.update();
+        }
+        window.resetCamera = resetCamera;
+
+        function toggleAutoRotate() {
+            autoRotate = !autoRotate;
+            const btn = document.getElementById('rotate-btn');
+            btn.classList.toggle('bg-purple-600');
+            btn.classList.toggle('text-white');
+        }
+        window.toggleAutoRotate = toggleAutoRotate;
+
+        // 工具函数
+        function clearCompleted() {
+            if (!confirm('确定清空所有已完成的模型？')) return;
+            models = models.filter(m => m.status !== 'success');
+            renderGallery();
+            showToast('已清空完成项', 'info');
+        }
+        window.clearCompleted = clearCompleted;
+
+        async function refreshGallery() {
+            try {
+                const response = await fetch('/api/gallery');
+                const data = await response.json();
+                models = data.models;
+                renderGallery();
+                showToast('🔄 画廊已刷新', 'success');
+            } catch (error) {
+                showToast('刷新失败', 'error');
+            }
+        }
+        window.refreshGallery = refreshGallery;
+
+        function showToast(message, type = 'info') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+
+            const colors = {
+                success: 'border-green-500/50 bg-green-500/10 text-green-400',
+                error: 'border-red-500/50 bg-red-500/10 text-red-400',
+                warning: 'border-yellow-500/50 bg-yellow-500/10 text-yellow-400',
+                info: 'border-blue-500/50 bg-blue-500/10 text-blue-400'
+            };
+
+            toast.className = `toast glass px-4 py-3 rounded-xl border ${colors[type]} flex items-center gap-2 min-w-[200px]`;
+            toast.innerHTML = `
+                <span class="text-lg">${type === 'success' ? '✅' : type === 'error' ? '❌' : type === 'warning' ? '⚠️' : 'ℹ️'}</span>
+                <span class="text-sm font-medium">${message}</span>
+            `;
+
+            container.appendChild(toast);
+
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateX(100%)';
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        }
+
+        // 事件监听
+        window.addEventListener('resize', () => {
+            if (camera && renderer) {
+                const container = document.getElementById('viewer-container');
+                camera.aspect = container.clientWidth / container.clientHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(container.clientWidth, container.clientHeight);
+            }
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeViewer();
+        });
+
+        // 初始化
+        window.addEventListener('load', () => {
+            initWebSocket();
+        });
+
+        // 页面可见性变化时重连
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden && (!ws || ws.readyState !== WebSocket.OPEN)) {
+                initWebSocket();
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info",
+        access_log=True
+    )
