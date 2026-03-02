@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 # ============ 配置管理 ============
 class Settings:
     """集中配置管理"""
-    TRIPO_API_KEY: str = os.getenv("TRIPO_API_KEY", "tsk_dHJpmRJbMYmmmuZgrj8vUJkYGNcMLB1WjJQNU6XN2MN")
+    TRIPO_API_KEY: str = os.getenv("TRIPO_API_KEY", "ts")
     TRIPO_API_URL: str = "https://api.tripo3d.ai/v2/openapi"
     MAX_POLL_ATTEMPTS: int = 180  # 轮询最大次数
     POLL_INTERVAL: float = 2.0  # 轮询间隔（秒）
